@@ -1,0 +1,323 @@
+﻿// 指定kernal函數
+#pragma kernel ForceCS      // 計算加速度
+#pragma kernel IntegrateCS  // 計算速度, 位置
+
+// Boid data
+struct BoidData
+{
+	float3 velocity; // 速度
+	float3 position; // 位置
+};
+
+struct AttractPts
+{
+	float3 pts[2];
+	float3 acc[2];
+};
+
+struct Affector
+{
+	float3 position;
+	float force;
+};
+// Thread Group 的 Thread Size
+#define SIMULATION_BLOCK_SIZE 256
+
+// Boid data的buffer（讀取用）
+StructuredBuffer<BoidData>   _BoidDataBufferRead;
+// Boid data的buffer（讀取, 寫入用）
+RWStructuredBuffer<BoidData> _BoidDataBufferWrite;
+// Boid加速度（讀取用）
+StructuredBuffer<float3>     _BoidForceBufferRead;
+// Boid data的buffer（讀取, 寫入用）
+RWStructuredBuffer<float3>   _BoidForceBufferWrite;
+
+RWStructuredBuffer<Affector>   _BoidAffectorDataBuffer;
+
+int _MaxBoidObjectNum; // Boid 數量
+
+float _DeltaTime;      // 每一Frame時間
+
+float _SeparateNeighborhoodRadius;  // 與其他粒子分離之距離
+float _AlignmentNeighborhoodRadius; // 與其他粒子整列之距離
+float _CohesionNeighborhoodRadius;  // 與其他粒子結合之距離
+
+float _MaxSpeed;        // 速度最大値
+float _MaxSteerForce;   // 加速度力の最大値
+
+float _SeparateWeight;  // 分離權重
+float _AlignmentWeight; // 整列權重
+float _CohesionWeight;  // 結合權重
+
+float4 _WallCenter;      // 範圍中心座標
+float4 _WallSize;        // 範圍size
+float  _AvoidWallWeight; // 閃避範圍之強度
+float force_Scale;
+float3 attpts[2];
+int _AffectorCount;
+float AffectorDistance;
+float AffectorForce;
+float3 PlanePoint;
+float3 PlaneNormal;
+
+// 向量大小限制
+float3 limit(float3 vec, float max)
+{
+	float length = sqrt(dot(vec, vec)); // 大きさ
+	return (length > max&& length > 0) ? vec.xyz * (max / length) : vec.xyz;
+}
+
+// 碰壁時反彈之力
+float3 avoidWall(float3 position)
+{
+	float3 wc = _WallCenter.xyz;
+	float3 ws = _WallSize.xyz;
+	float3 acc = float3(0, 0, 0);
+	// x
+	acc.x = (position.x < wc.x - ws.x * 0.5) ? acc.x + 1.0 : acc.x;
+	acc.x = (position.x > wc.x + ws.x * 0.5) ? acc.x - 1.0 : acc.x;
+
+	// y
+	acc.y = (position.y < wc.y - ws.y * 0.5) ? acc.y + 1.0 : acc.y;
+	acc.y = (position.y > wc.y + ws.y * 0.5) ? acc.y - 1.0 : acc.y;
+
+	// z
+	acc.z = (position.z < wc.z - ws.z * 0.5) ? acc.z + 1.0 : acc.z;
+	acc.z = (position.z > wc.z + ws.z * 0.5) ? acc.z - 1.0 : acc.z;
+
+	return acc;
+}
+
+float hash(float n)
+{
+	return frac(sin(n) * 43758.5453);
+}
+
+float hashNoise(float3 x)
+{
+	float3 p = floor(x);
+	float3 f = frac(x);
+
+	f = f * f * (3.0 - 2.0 * f);
+	float n = p.x + p.y * 57.0 + 113.0 * p.z;
+
+	return lerp(lerp(lerp(hash(n + 0.0), hash(n + 1.0), f.x),
+		lerp(hash(n + 57.0), hash(n + 58.0), f.x), f.y),
+		lerp(lerp(hash(n + 113.0), hash(n + 114.0), f.x),
+			lerp(hash(n + 170.0), hash(n + 171.0), f.x), f.y), f.z);
+}
+
+// Shared Memory  Boidデータ格納用
+groupshared BoidData boid_data[SIMULATION_BLOCK_SIZE];
+float3 SetVectorLength(float3 v, float s) {
+	float3 vectorNormalized = normalize(v);
+	return vectorNormalized * s;
+}
+
+float SignedDistancePlanePoint(float3 _point) {
+	float3 diff = _point - PlanePoint;
+	return dot(PlaneNormal, diff);
+}
+
+float3 ProjectPointOnPlane(float3 _point) {
+	float distance = SignedDistancePlanePoint(_point);
+	distance *= -1;
+	float3 translationVector = SetVectorLength(PlaneNormal, distance);
+	return _point + translationVector;
+}
+// 加速度計算之kernal函數
+[numthreads(SIMULATION_BLOCK_SIZE, 1, 1)]
+void ForceCS
+(
+	uint3 DTid : SV_DispatchThreadID, // thread ID
+	uint3 Gid : SV_GroupID,           // group ID
+	uint3 GTid : SV_GroupThreadID,    // group內的thread ID
+	uint  GI : SV_GroupIndex          // SV_GroupThreadIDを一次元にしたもの 0-255
+)
+{
+	const unsigned int P_ID = DTid.x; // 自身ID
+	float3 P_position = _BoidDataBufferRead[P_ID].position; // 自身位置
+	float3 P_velocity = _BoidDataBufferRead[P_ID].velocity; // 自身速度
+
+	float3 force = float3(0, 0, 0); // 初始化加速度
+
+	float3 sepPosSum = float3(0, 0, 0); // 計算分離時的位置增量變數
+	int sepCount = 0; // 計算分離時的數量
+
+	float3 aliVelSum = float3(0, 0, 0); // 
+	int aliCount = 0; // 
+
+	float3 cohPosSum = float3(0, 0, 0); // 
+	int cohCount = 0; // 
+
+	// SIMULATION_BLOCK_SIZE（group thread數）ごとの実行 (グループ数分実行)   每個粒子與附近的粒子逐一計算
+	[loop]
+	for (uint N_block_ID = 0; N_block_ID < (uint)_MaxBoidObjectNum;
+		N_block_ID += SIMULATION_BLOCK_SIZE)							//SIMULATION_BLOCK_SIZE = 256
+	{
+		// SIMULATION_BLOCK_SIZE分のBoidデータを、シェアードメモリに格納
+		boid_data[GI] = _BoidDataBufferRead[N_block_ID + GI];			//
+
+		// すべてのグループ共有アクセスが完了し、
+		// グループ内のすべてのスレッドがこの呼び出しに到達するまで、
+		// グループ内のすべてのスレッドの実行をブロックする
+		GroupMemoryBarrierWithGroupSync();
+
+		// 他の個体との計算  		
+		for (int N_tile_ID = 0; N_tile_ID < SIMULATION_BLOCK_SIZE; N_tile_ID++)
+		{
+			float3 N_position = boid_data[N_tile_ID].position; // 其他個體的位置
+			float3 N_velocity = boid_data[N_tile_ID].velocity; // 其他個體的速度
+
+			float3 diff = P_position - N_position; // 自身與其他位置的差
+			float  dist = sqrt(dot(diff, diff));   // 自身與其他個體位置的距離
+
+			// --- 分離（Separation） ---
+			if (dist > 0.0 && dist <= _SeparateNeighborhoodRadius)
+			{
+				// 其他個體指向自身之向量
+				float3 repulse = normalize(P_position - N_position);
+				// 除以自身與其他個體位置之距離（距離遠影響漸小）
+				repulse /= dist;
+				sepPosSum += repulse; // 累加
+				sepCount++;           // 個體數累加
+			}
+
+			// --- 整列（Alignment） ---
+			if (dist > 0.0 && dist <= _AlignmentNeighborhoodRadius)
+			{
+				aliVelSum += N_velocity; // 
+				aliCount++;              // 
+			}
+
+			// --- 結合（Cohesion） ---
+			if (dist > 0.0 && dist <= _CohesionNeighborhoodRadius)
+			{
+				cohPosSum += N_position; // 
+				cohCount++;              //  
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	// 加速度（分離）
+	float3 sepSteer = (float3)0.0;
+	if (sepCount > 0)
+	{
+		sepSteer = sepPosSum;// / (float)sepCount;     // 求平均
+		sepSteer = normalize(sepSteer) * _MaxSpeed; // 最大速度調整
+		sepSteer = sepSteer - P_velocity;           // 加速度計算
+		sepSteer = limit(sepSteer, _MaxSteerForce); // 加速度限制
+	}
+
+	// 加速度（整列）
+	float3 aliSteer = (float3)0.0;
+	if (aliCount > 0)
+	{
+		aliSteer = aliVelSum / (float)aliCount;     // 求附近個體的速度平均
+		aliSteer = normalize(aliSteer) * _MaxSpeed; // 最大速度調整
+		aliSteer = aliSteer - P_velocity;           // 加速度計算  速度與速度(方向漸趨一致)
+		aliSteer = limit(aliSteer, _MaxSteerForce); // 加速度限制制限
+	}
+	// 加速度（結合）
+	float3 cohSteer = (float3)0.0;
+	if (cohCount > 0)
+	{
+		cohPosSum = cohPosSum / (float)cohCount;    // 求附近個體的位置平均
+		cohSteer = cohPosSum - P_position;			// 平均位置方向へのベクトルを求める  自身至目標的向量
+		cohSteer = normalize(cohSteer) * _MaxSpeed; // 最大速度調整
+		cohSteer = cohSteer - P_velocity;           // 往目標的方向與目前的方向之差為當即前往的方向
+		cohSteer = limit(cohSteer, _MaxSteerForce); // 加速度限制制限
+	}
+
+	float3 diff = 0;
+	for (int i = 0; i < _AffectorCount; i++) {
+		Affector affector = _BoidAffectorDataBuffer[i];
+		float3 affectorPosition = affector.position;
+		float3 affectorRelativePosition = affectorPosition;
+		float3 affectorCheckPosition = affectorRelativePosition;
+		float3 boidCheckPos = float3(P_position.x, P_position.y, P_position.z);
+		//boidCheckPos = ProjectPointOnPlane(P_position);
+		if (distance(boidCheckPos, affectorCheckPosition) < AffectorDistance) {
+			diff = boidCheckPos - affectorCheckPosition;
+			float diffLen = length(diff);
+			float scaler = clamp(1.0 - diffLen / AffectorForce, 0.0, 1.0);
+			//sepSteer += -1 * diff * (scaler / diffLen);
+			sepSteer += -clamp(hashNoise(_DeltaTime), 0.05, 1) * diff * (scaler / diffLen);
+			//cohSteer += clamp(hashNoise(_DeltaTime), 0, 1) * diff * (scaler / diffLen);
+		}
+	}
+
+	force += aliSteer * _AlignmentWeight; // 加速度加上整列力
+	force += cohSteer * _CohesionWeight;  // 加速度加上結合力
+	force += sepSteer * _SeparateWeight;  // 加速度加上分離力
+
+	float noiseEffector = clamp(hashNoise(_DeltaTime), 0, 1);
+	//if (noiseEffector > 0) {
+		//float3 direction = aliSteer * _AlignmentWeight + cohSteer * _CohesionWeight + sepSteer * _SeparateWeight;
+		//float ip = exp(-1 * _DeltaTime);
+		//force += lerp(normalize(0), (direction), ip);
+	//}
+
+	_BoidForceBufferWrite[P_ID] = force; // buffer寫入
+}
+
+float3 llpo1;
+float3 llpo2;
+float3 llpo3;
+
+float3 attractedPts(float3 position, float3 attPt) {
+	float _MaxAttrRange = 100;
+	float3 attrWeight = 10;
+	float3 acc = float3(0, 0, 0);
+	float3 diff = attPt - position;
+	float3 distance = sqrt(dot(diff, diff));
+	//acc = (distance < _MaxAttrRange) ? normalize(diff) * attrWeight / distance : 0;
+	acc = (distance < _MaxAttrRange) ? diff * (distance) * 0.01 : 0;
+
+	return acc;//(distance < _MaxAttrRange) ? normalize(attrPt - position) * attrWeight/ distance : 0;
+}
+// 速度, 位置計算用之函數
+[numthreads(SIMULATION_BLOCK_SIZE, 1, 1)]
+void IntegrateCS
+(
+	uint3 DTid : SV_DispatchThreadID // 全體thread的固定 ID
+)
+{
+	const unsigned int P_ID = DTid.x;          // 取得index
+
+	BoidData b = _BoidDataBufferWrite[P_ID];   // 讀取現在的Boid Data
+	float3 force = _BoidForceBufferRead[P_ID]; // 讀取加速度
+
+	// 碰壁時的反彈力
+	force += avoidWall(b.position) * _AvoidWallWeight;
+	//float3 attpts[2] = { float3(5, -10, -7), float3(-15, 8, 4) };
+	//for (int i = 0; i < 2; i++)
+	//{
+	//force += attractedPts(b.position, llpo1);
+	force += attractedPts(b.position, llpo2);
+	//force += attractedPts(b.position, llpo3);
+	//}
+
+
+	float noise = clamp(hashNoise(_DeltaTime / 100.0), -1, 1) * 2.0 + 1.0; //-1-3
+	//b.velocity *= (1.0 + noise * 0.9)*0.9;
+
+	force *= force_Scale;
+	b.velocity += force * _DeltaTime;          // 以加速度計算當前的速度
+	b.velocity = limit(b.velocity, _MaxSpeed); // 速度限制
+	//if (noiseEffector > 0) {
+	//	//float3 direction = alignment + separation + cohesion;
+	//	float ip = exp(-RotationSpeed * DeltaTime);
+	//	b.force = lerp((force), normalize(b.force), ip);
+	//	//boid.direction *= BoundaryCondition(boid.position, boid.direction);
+	//	b.position += (b.force) * (b.velocity * DeltaTime);
+	//}
+	//else {
+	//	b.position += (b.force) * (b.velocity * DeltaTime);
+	//}
+
+	b.position += b.velocity * _DeltaTime;     // 位置更新
+
+	_BoidDataBufferWrite[P_ID] = b;            // 計算結果寫入
+}

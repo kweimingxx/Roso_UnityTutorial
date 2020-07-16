@@ -1,0 +1,5 @@
+sceneSetups:
+- path: Assets/L1/BoidsCharacterSimulationOnGPU.unity
+  isLoaded: 1
+  isActive: 1
+  isSubScene: 0
